@@ -19,16 +19,19 @@ Censorship in Indonesia works at two stages:
 
 ## 🚀 Quick Start
 
-### 1. Build the Binary
+### 1. Build & Install Globally
 ```bash
+# Build and install to ~/.local/bin/bypass-proxy
+make install
+
+# Or build locally in the directory:
 make build
-# Or directly with Go:
-go build -o bypass-proxy ./cmd/proxy
 ```
 
-### 2. Run the Proxy
+### 2. Run from Anywhere
+Since `~/.local/bin` is in your `$PATH`, you can now run it from any directory:
 ```bash
-./bypass-proxy
+bypass-proxy
 ```
 By default:
 - HTTP/HTTPS Proxy runs at `127.0.0.1:8080`
