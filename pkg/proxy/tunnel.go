@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"bypass-proxy/pkg/doh"
+	"bypass-proxy/pkg/relay"
 	"bypass-proxy/pkg/sni"
 )
 
@@ -21,6 +22,7 @@ type Config struct {
 	SplitStrategy sni.SplitStrategy
 	MicroDelay    time.Duration
 	DialTimeout   time.Duration
+	RelayWorker   string // Host of upstream Cloudflare Worker relay (e.g. bypass-relay.willson2016pos.workers.dev)
 }
 
 // Tunnel handles connecting to remote targets and applying DPI-evasion techniques.
@@ -34,15 +36,19 @@ func NewTunnel(cfg Config) *Tunnel {
 		cfg.Resolver = doh.NewResolver()
 	}
 	if cfg.MicroDelay <= 0 {
-		cfg.MicroDelay = 5 * time.Millisecond
+		cfg.MicroDelay = 15 * time.Millisecond
 	}
 	if cfg.DialTimeout <= 0 {
-		cfg.DialTimeout = 10 * time.Second
+		cfg.DialTimeout = 6 * time.Second
+	}
+	if cfg.RelayWorker == "" {
+		cfg.RelayWorker = "bypass-relay.willson2016pos.workers.dev"
 	}
 	return &Tunnel{cfg: cfg}
 }
 
 // DialTarget resolves the host using DoH and dials a TCP connection.
+// If target is IP-blackholed or direct dial fails, it routes through Cloudflare Worker relay.
 func (t *Tunnel) DialTarget(ctx context.Context, target string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
@@ -54,19 +60,38 @@ func (t *Tunnel) DialTarget(ctx context.Context, target string) (net.Conn, error
 		return nil, fmt.Errorf("invalid port %s: %w", portStr, err)
 	}
 
+	// 1. If target matches blackholed domain list, use Cloudflare Worker immediately
+	if t.cfg.RelayWorker != "" && relay.IsBlackholeCandidate(host) {
+		log.Printf("[Relay] Routing IP-blackholed target %s via Cloudflare Worker (%s)", target, t.cfg.RelayWorker)
+		conn, err := relay.DialWS(ctx, t.cfg.Resolver, t.cfg.RelayWorker, target)
+		if err == nil {
+			return conn, nil
+		}
+		log.Printf("[Relay] Cloudflare Worker dial failed: %v, falling back to direct", err)
+	}
+
+	// 2. Direct connection with DoH resolution
 	ip, err := t.cfg.Resolver.ResolveOne(ctx, host)
 	if err != nil {
-		// Fallback to standard resolver if DoH fails
 		ip = host
 	}
 
 	destAddr := net.JoinHostPort(ip, strconv.Itoa(port))
 	dialer := net.Dialer{
-		Timeout: t.cfg.DialTimeout,
+		Timeout: 3 * time.Second,
 	}
 
 	conn, err := dialer.DialContext(ctx, "tcp", destAddr)
 	if err != nil {
+		// 3. Fallback to Cloudflare Worker relay if direct dial fails
+		if t.cfg.RelayWorker != "" {
+			log.Printf("[Relay] Direct connection to %s failed (%v). Falling back to Cloudflare Worker relay...", target, err)
+			relayConn, relayErr := relay.DialWS(ctx, t.cfg.Resolver, t.cfg.RelayWorker, target)
+			if relayErr == nil {
+				return relayConn, nil
+			}
+			return nil, fmt.Errorf("both direct (%v) and relay (%v) failed for %s", err, relayErr, target)
+		}
 		return nil, fmt.Errorf("failed to connect to %s (%s): %w", target, destAddr, err)
 	}
 
@@ -95,23 +120,32 @@ func (t *Tunnel) RelayHandshakeAndBridge(clientConn, remoteConn net.Conn) error 
 
 	clientData := initialBuf[:n]
 
-	// Check if this is a TLS ClientHello
-	info, err := sni.ParseClientHello(clientData)
-	if err == nil && info.IsTLS {
-		splitPoints := sni.CalculateSplitPoints(clientData, info, t.cfg.SplitStrategy)
-		if len(splitPoints) > 0 {
-			if err := sni.WriteFragmented(remoteConn, clientData, splitPoints, t.cfg.MicroDelay); err != nil {
-				return fmt.Errorf("failed writing fragmented ClientHello: %w", err)
+	// Check if this connection is already tunneled through Cloudflare Worker relay
+	_, isRelay := remoteConn.(*relay.WSConn)
+
+	if !isRelay {
+		// Direct connection through local ISP: apply SNI fragmentation
+		info, err := sni.ParseClientHello(clientData)
+		if err == nil && info.IsTLS {
+			splitPoints := sni.CalculateSplitPoints(clientData, info, t.cfg.SplitStrategy)
+			if len(splitPoints) > 0 {
+				if err := sni.WriteFragmented(remoteConn, clientData, splitPoints, t.cfg.MicroDelay); err != nil {
+					return fmt.Errorf("failed writing fragmented ClientHello: %w", err)
+				}
+			} else {
+				if _, err := remoteConn.Write(clientData); err != nil {
+					return fmt.Errorf("failed writing ClientHello: %w", err)
+				}
 			}
 		} else {
 			if _, err := remoteConn.Write(clientData); err != nil {
-				return fmt.Errorf("failed writing ClientHello: %w", err)
+				return fmt.Errorf("failed writing initial payload: %w", err)
 			}
 		}
 	} else {
-		// Non-TLS initial packet, write as-is
+		// Remote connection outside Indonesia: write directly into WebSocket tunnel
 		if _, err := remoteConn.Write(clientData); err != nil {
-			return fmt.Errorf("failed writing initial payload: %w", err)
+			return fmt.Errorf("failed writing initial payload to relay: %w", err)
 		}
 	}
 

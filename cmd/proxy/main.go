@@ -31,6 +31,7 @@ func main() {
 	strategyStr := flag.String("strategy", "early", "SNI split strategy: 'early' (split at byte 30, recommended), 'sni' (split middle of hostname), 'multi' (multi-chunk)")
 	delayMs := flag.Int("delay", 15, "Delay between packet fragments in milliseconds")
 	dohList := flag.String("doh", "https://1.1.1.1/dns-query,https://1.0.0.1/dns-query,https://8.8.8.8/resolve", "Comma-separated DoH endpoints")
+	relayWorker := flag.String("relay", "bypass-relay.willson2016pos.workers.dev", "Cloudflare Worker relay host for IP-blackholed sites (leave blank to disable)")
 	autoSysProxy := flag.Bool("sysproxy", true, "Automatically configure macOS system proxy on start/exit")
 	runTest := flag.Bool("test", false, "Run connectivity self-test against blocked targets")
 	flag.Parse()
@@ -56,6 +57,7 @@ func main() {
 		SplitStrategy: strategy,
 		MicroDelay:    time.Duration(*delayMs) * time.Millisecond,
 		DialTimeout:   10 * time.Second,
+		RelayWorker:   strings.TrimSpace(*relayWorker),
 	}
 
 	tunnel := proxy.NewTunnel(cfg)
@@ -137,9 +139,10 @@ func runConnectivitySelfTest(tunnel *proxy.Tunnel) {
 		name string
 		url  string
 	}{
-		{"Reddit (Blocked by Kominfo)", "https://www.reddit.com"},
-		{"Vimeo (Blocked by Kominfo)", "https://vimeo.com"},
+		{"Reddit (DPI Blocked)", "https://www.reddit.com"},
+		{"Vimeo (DPI Blocked)", "https://vimeo.com"},
 		{"DuckDuckGo", "https://duckduckgo.com"},
+		{"Pornhub (IP Blackhole -> CF Relay)", "https://www.pornhub.com"},
 	}
 
 	// Spin up a temporary proxy on random port for testing
