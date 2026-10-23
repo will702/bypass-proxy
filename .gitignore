@@ -1,0 +1,18 @@
+# Binaries
+bypass-proxy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Cloudflare Wrangler
+.wrangler/
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
